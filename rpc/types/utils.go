@@ -1,0 +1,366 @@
+// Copyright 2021 Evmos Foundation
+// This file is part of Evmos' Ethermint library.
+//
+// The Ethermint library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The Ethermint library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the Ethermint library. If not, see https://github.com/evmos/ethermint/blob/main/LICENSE
+package types
+
+import (
+	"context"
+	"fmt"
+	"math/big"
+	"strings"
+
+	abci "github.com/cometbft/cometbft/abci/types"
+	tmtypes "github.com/cometbft/cometbft/types"
+
+	errorsmod "cosmossdk.io/errors"
+	"github.com/cosmos/cosmos-sdk/client"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
+
+	evmtypes "github.com/evmos/ethermint/x/evm/types"
+	feemarkettypes "github.com/evmos/ethermint/x/feemarket/types"
+
+	tmrpcclient "github.com/cometbft/cometbft/rpc/client"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	ethtypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/trie"
+	ethermint "github.com/evmos/ethermint/types"
+)
+
+// ExceedBlockGasLimitError defines the error message when tx execution exceeds the block gas limit.
+// The tx fee is deducted in ante handler, so it shouldn't be ignored in JSON-RPC API.
+const ExceedBlockGasLimitError = "out of gas in location: block gas meter; gasWanted:"
+
+// RawTxToEthTx returns a evm MsgEthereum transaction from raw tx bytes.
+func RawTxToEthTx(clientCtx client.Context, txBz tmtypes.Tx) ([]*evmtypes.MsgEthereumTx, error) {
+	tx, err := clientCtx.TxConfig.TxDecoder()(txBz)
+	if err != nil {
+		return nil, errorsmod.Wrap(errortypes.ErrJSONUnmarshal, err.Error())
+	}
+
+	ethTxs := make([]*evmtypes.MsgEthereumTx, len(tx.GetMsgs()))
+	for i, msg := range tx.GetMsgs() {
+		ethTx, ok := msg.(*evmtypes.MsgEthereumTx)
+		if !ok {
+			return nil, fmt.Errorf("invalid message type %T, expected %T", msg, &evmtypes.MsgEthereumTx{})
+		}
+		ethTxs[i] = ethTx
+	}
+	return ethTxs, nil
+}
+
+// EvmTxHashFromMsgs computes the EVM transactionsRoot via DeriveSha.
+func EvmTxHashFromMsgs(msgs []*evmtypes.MsgEthereumTx) common.Hash {
+	if len(msgs) == 0 {
+		return ethtypes.EmptyRootHash
+	}
+	txs := make(ethtypes.Transactions, len(msgs))
+	for i, msg := range msgs {
+		txs[i] = msg.AsTransaction()
+	}
+	return ethtypes.DeriveSha(txs, trie.NewStackTrie(nil))
+}
+
+// EvmMsgsFromTxs extracts EVM messages from raw block txs, filtered by tx results.
+// Returns an error if len(txs) != len(txResults), or if txDecoder fails on any
+// includable tx. Previously, decode failures were silently skipped; callers that
+// relied on that behavior should handle the new error.
+func EvmMsgsFromTxs(txDecoder sdk.TxDecoder, txs tmtypes.Txs, txResults []*abci.ExecTxResult) ([]*evmtypes.MsgEthereumTx, error) {
+	if len(txs) != len(txResults) {
+		return nil, fmt.Errorf("tx count mismatch: %d txs but %d results", len(txs), len(txResults))
+	}
+	var msgs []*evmtypes.MsgEthereumTx
+	for i, rawTx := range txs {
+		if !TxSuccessOrExceedsBlockGasLimit(txResults[i]) {
+			continue
+		}
+		tx, err := txDecoder(rawTx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode tx at index %d: %w", i, err)
+		}
+		for _, msg := range tx.GetMsgs() {
+			if ethMsg, ok := msg.(*evmtypes.MsgEthereumTx); ok {
+				msgs = append(msgs, ethMsg)
+			}
+		}
+	}
+	return msgs, nil
+}
+
+// EthHeaderFromTendermint returns an Ethereum Header from a Tendermint Header.
+// TxHash is always EmptyRootHash; callers set it via EvmTxHashFromMsgs.
+func EthHeaderFromTendermint(header tmtypes.Header, bloom ethtypes.Bloom, baseFee *big.Int, miner sdk.AccAddress) *ethtypes.Header {
+	var (
+		blockTime uint64
+		err       error
+	)
+	time := header.Time
+	if !time.IsZero() {
+		blockTime, err = ethermint.SafeUint64(time.Unix())
+		if err != nil {
+			panic(err)
+		}
+	}
+	return &ethtypes.Header{
+		ParentHash:       common.BytesToHash(header.LastBlockID.Hash.Bytes()),
+		UncleHash:        ethtypes.EmptyUncleHash,
+		Coinbase:         common.BytesToAddress(miner),
+		Root:             common.BytesToHash(header.AppHash),
+		TxHash:           ethtypes.EmptyRootHash,
+		ReceiptHash:      ethtypes.EmptyRootHash,
+		Bloom:            bloom,
+		Difficulty:       big.NewInt(0),
+		Number:           big.NewInt(header.Height),
+		GasLimit:         0,
+		GasUsed:          0,
+		Time:             blockTime,
+		Extra:            []byte{},
+		MixDigest:        common.Hash{},
+		Nonce:            ethtypes.BlockNonce{},
+		BaseFee:          baseFee,
+		WithdrawalsHash:  &ethtypes.EmptyWithdrawalsHash, // EIP-4895
+		BlobGasUsed:      new(uint64),                    // EIP-4844
+		ExcessBlobGas:    new(uint64),                    // EIP-4844
+		ParentBeaconRoot: &ethtypes.EmptyRootHash,        // EIP-4788
+		RequestsHash:     &ethtypes.EmptyRequestsHash,    // EIP-7685
+	}
+}
+
+// BlockMaxGasFromConsensusParams returns the gas limit for the current block from the chain consensus params.
+func BlockMaxGasFromConsensusParams(goCtx context.Context, clientCtx client.Context, blockHeight int64) (int64, error) {
+	tmrpcClient, ok := clientCtx.Client.(tmrpcclient.Client)
+	if !ok {
+		panic("incorrect tm rpc client")
+	}
+
+	resConsParams, err := tmrpcClient.ConsensusParams(goCtx, &blockHeight)
+	if err != nil {
+		return int64(^uint32(0)), err
+	}
+
+	gasLimit := resConsParams.ConsensusParams.Block.MaxGas
+	if gasLimit == -1 {
+		// Sets gas limit to max uint32 to not error with javascript dev tooling
+		// This -1 value indicating no block gas limit is set to max uint64 with geth hexutils
+		// which errors certain javascript dev tooling which only supports up to 53 bits
+		gasLimit = int64(^uint32(0))
+	}
+
+	return gasLimit, nil
+}
+
+// FormatBlock creates an ethereum block from a tendermint header and ethereum-formatted
+// transactions.
+func FormatBlock(
+	head *ethtypes.Header,
+	cometHash []byte,
+	size int,
+	transactions []interface{},
+) map[string]interface{} {
+	s, err := ethermint.SafeIntToUint64(size)
+	if err != nil {
+		panic(err)
+	}
+
+	fields := RPCMarshalHeader(head)
+	// Override with the CometBFT hash; RPCMarshalHeader sets "hash" to the
+	// Ethereum RLP hash which differs from the canonical Tendermint block hash.
+	fields["hash"] = common.BytesToHash(cometHash)
+	fields["size"] = hexutil.Uint64(s)
+	fields["transactions"] = transactions
+	fields["uncles"] = []common.Hash{}
+
+	// Ethermint has no real withdrawals; emit an empty array post-Shanghai.
+	if head.WithdrawalsHash != nil {
+		fields["withdrawals"] = ethtypes.Withdrawals{}
+	}
+
+	return fields
+}
+
+// NewTransactionFromMsg returns a transaction that will serialize to the RPC
+// representation, with the given location metadata set (if available).
+func NewTransactionFromMsg(
+	msg *evmtypes.MsgEthereumTx,
+	blockHash common.Hash,
+	blockNumber, blockTime, index uint64,
+	baseFee *big.Int,
+	chainID *big.Int,
+) (*RPCTransaction, error) {
+	return NewRPCTransaction(msg, blockHash, blockNumber, blockTime, index, baseFee, chainID)
+}
+
+func NewRPCTransactionFromTx(
+	tx *ethtypes.Transaction, sender common.Address, blockHash common.Hash, blockNumber, blockTime, index uint64, baseFee *big.Int,
+	chainID *big.Int,
+) (*RPCTransaction, error) {
+	v, r, s := tx.RawSignatureValues()
+	result := &RPCTransaction{
+		Type:     hexutil.Uint64(tx.Type()),
+		From:     sender,
+		Gas:      hexutil.Uint64(tx.Gas()),
+		GasPrice: (*hexutil.Big)(tx.GasPrice()),
+		Hash:     tx.Hash(),
+		Input:    hexutil.Bytes(tx.Data()),
+		Nonce:    hexutil.Uint64(tx.Nonce()),
+		To:       tx.To(),
+		Value:    (*hexutil.Big)(tx.Value()),
+		V:        (*hexutil.Big)(v),
+		R:        (*hexutil.Big)(r),
+		S:        (*hexutil.Big)(s),
+		ChainID:  (*hexutil.Big)(chainID),
+	}
+	if blockHash != (common.Hash{}) {
+		result.BlockHash = &blockHash
+		result.BlockNumber = (*hexutil.Big)(new(big.Int).SetUint64(blockNumber))
+		if blockTime > 0 {
+			result.BlockTimestamp = (*hexutil.Uint64)(&blockTime)
+		}
+		result.TransactionIndex = (*hexutil.Uint64)(&index)
+	}
+	yparity := hexutil.Uint64(v.Sign()) //#nosec G115
+	switch tx.Type() {
+	case ethtypes.AccessListTxType:
+		al := tx.AccessList()
+		result.Accesses = &al
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+		result.YParity = &yparity
+	case ethtypes.DynamicFeeTxType:
+		al := tx.AccessList()
+		result.Accesses = &al
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+		result.YParity = &yparity
+		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
+		result.GasTipCap = (*hexutil.Big)(tx.GasTipCap())
+		// if the transaction has been mined, compute the effective gas price
+		if baseFee != nil && blockHash != (common.Hash{}) {
+			// price = min(tip + baseFee, gasFeeCap)
+			price := ethermint.BigMin(new(big.Int).Add(tx.GasTipCap(), baseFee), tx.GasFeeCap())
+			result.GasPrice = (*hexutil.Big)(price)
+		} else {
+			result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
+		}
+	case ethtypes.SetCodeTxType:
+		al := tx.AccessList()
+		result.Accesses = &al
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+		result.YParity = &yparity
+		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
+		result.GasTipCap = (*hexutil.Big)(tx.GasTipCap())
+		if baseFee != nil && blockHash != (common.Hash{}) {
+			price := ethermint.BigMin(new(big.Int).Add(tx.GasTipCap(), baseFee), tx.GasFeeCap())
+			result.GasPrice = (*hexutil.Big)(price)
+		} else {
+			result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
+		}
+		result.AuthorizationList = tx.SetCodeAuthorizations()
+	case ethtypes.BlobTxType:
+		al := tx.AccessList()
+		result.Accesses = &al
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+		result.YParity = &yparity
+		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
+		result.GasTipCap = (*hexutil.Big)(tx.GasTipCap())
+		if baseFee != nil && blockHash != (common.Hash{}) {
+			price := ethermint.BigMin(new(big.Int).Add(tx.GasTipCap(), baseFee), tx.GasFeeCap())
+			result.GasPrice = (*hexutil.Big)(price)
+		} else {
+			result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
+		}
+		result.MaxFeePerBlobGas = (*hexutil.Big)(tx.BlobGasFeeCap())
+		if hashes := tx.BlobHashes(); hashes != nil {
+			result.BlobVersionedHashes = hashes
+		}
+	}
+	return result, nil
+}
+
+// NewTransactionFromData returns a transaction that will serialize to the RPC
+// representation, with the given location metadata set (if available).
+func NewRPCTransaction(
+	msg *evmtypes.MsgEthereumTx, blockHash common.Hash, blockNumber, blockTime, index uint64, baseFee *big.Int,
+	chainID *big.Int,
+) (*RPCTransaction, error) {
+	tx := msg.AsTransaction()
+	// Determine the signer. For replay-protected transactions, use the most permissive
+	// signer, because we assume that signers are backwards-compatible with old
+	// transactions. For non-protected transactions, the frontier signer is used
+	// because the latest signer will reject the unprotected transactions.
+	var signer ethtypes.Signer
+	if tx.Protected() {
+		signer = ethtypes.LatestSignerForChainID(tx.ChainId())
+	} else {
+		signer = ethtypes.FrontierSigner{}
+	}
+	from, err := msg.GetSenderLegacy(signer)
+	if err != nil {
+		return nil, err
+	}
+	return NewRPCTransactionFromTx(tx, from, blockHash, blockNumber, blockTime, index, baseFee, chainID)
+}
+
+// BaseFeeFromEvents parses the feemarket basefee from cosmos events
+func BaseFeeFromEvents(events []abci.Event) *big.Int {
+	for _, event := range events {
+		if event.Type != feemarkettypes.EventTypeFeeMarket {
+			continue
+		}
+
+		for _, attr := range event.Attributes {
+			if attr.Key == feemarkettypes.AttributeKeyBaseFee {
+				result, success := new(big.Int).SetString(attr.Value, 10)
+				if success {
+					return result
+				}
+
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+// CheckTxFee is an internal function used to check whether the fee of
+// the given transaction is _reasonable_(under the cap).
+func CheckTxFee(gasPrice *big.Int, gas uint64, feeCap float64) error {
+	// Short circuit if there is no cap for transaction fee at all.
+	if feeCap == 0 {
+		return nil
+	}
+	totalfee := new(big.Float).SetInt(new(big.Int).Mul(gasPrice, new(big.Int).SetUint64(gas)))
+	// 1 photon in 10^18 aphoton
+	oneToken := new(big.Float).SetInt(big.NewInt(params.Ether))
+	// quo = rounded(x/y)
+	feeEth := new(big.Float).Quo(totalfee, oneToken)
+	// no need to check error from parsing
+	feeFloat, _ := feeEth.Float64()
+	if feeFloat > feeCap {
+		return fmt.Errorf("tx fee (%.2f ether) exceeds the configured cap (%.2f ether)", feeFloat, feeCap)
+	}
+	return nil
+}
+
+// TxExceedBlockGasLimit returns true if the tx exceeds block gas limit.
+func TxExceedBlockGasLimit(res *abci.ExecTxResult) bool {
+	return strings.Contains(res.Log, ExceedBlockGasLimitError)
+}
+
+// TxSuccessOrExceedsBlockGasLimit returns true if the transaction was successful
+// or if it failed with an ExceedBlockGasLimit error
+func TxSuccessOrExceedsBlockGasLimit(res *abci.ExecTxResult) bool {
+	return res.Code == 0 || TxExceedBlockGasLimit(res)
+}

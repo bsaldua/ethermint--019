@@ -1,0 +1,52 @@
+name: "Dependency Review"
+on:
+  pull_request:
+    paths:
+      - "**/*.go"
+      - "**/go.mod"
+      - "**/go.sum"
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout Repository"
+        uses: actions/checkout@v7
+      - name: "Setup Go"
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.11"
+          check-latest: true
+      - name: "Dependency Review"
+        uses: actions/dependency-review-action@v5
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha || 'master' }}
+          head-ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          fail-on-severity: high
+      - name: "Go vulnerability check"
+        id: govuln
+        run: |
+          # GO-2026-4479 is an unfixable vuln in github.com/pion/dtls/v2, pulled in
+          # transitively via go-ethereum p2p → pion/stun/v2. Pion upstream only
+          # patched v3; there is no v2 fix.
+          # GO-2024-2584 is a slashing-evasion issue in cosmos-sdk itself; the
+          # govulndb entry has "Fixed in: N/A" — no upstream patch exists.
+          ALLOWED="GO-2026-4479 GO-2024-2584"
+
+          make vulncheck 2>&1 | tee govulncheck-output.txt || true
+
+          vulnerabilities=$(grep -oE 'GO-[0-9]{4}-[0-9]+' govulncheck-output.txt | sort -u)
+          echo "Detected vulnerabilities: $vulnerabilities"
+
+          for vuln in $vulnerabilities; do
+            if ! echo "$ALLOWED" | grep -qw "$vuln"; then
+              echo "Unallowed vulnerability $vuln found; failing."
+              exit 1
+            fi
+          done
+
+          echo "Only known unfixable vulnerability ($ALLOWED) present. Continuing."

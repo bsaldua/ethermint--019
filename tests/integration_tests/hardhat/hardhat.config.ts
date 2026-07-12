@@ -1,0 +1,34 @@
+import type { HardhatUserConfig } from "hardhat/config";
+import "@typechain/hardhat";
+import "@openzeppelin/hardhat-upgrades";
+import "@nomicfoundation/hardhat-ethers";
+
+const config: HardhatUserConfig = {
+  solidity: {
+    compilers: [
+      {
+        version: "0.8.21",
+        settings: {
+          optimizer: {
+            enabled: true
+          },
+          evmVersion: "shanghai"
+        }
+      },
+      {
+        version: "0.8.10",
+        settings: {
+          optimizer: {
+            enabled: true
+          }
+        }
+      },
+    ],
+  },
+  typechain: {
+    outDir: "typechain",
+    target: "ethers-v6",
+  },
+};
+
+export default config;

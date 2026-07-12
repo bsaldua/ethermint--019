@@ -1,0 +1,79 @@
+version: "2"
+run:
+  tests: false
+linters:
+  enable:
+    - asciicheck
+    - bodyclose
+    - dogsled
+    - dupl
+    - goconst
+    - gocritic
+    - gomodguard
+    - gosec
+    - lll
+    - misspell
+    - nakedret
+    - nolintlint
+    - prealloc
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - whitespace
+  settings:
+    dogsled:
+      max-blank-identifiers: 3
+    gomodguard:
+      blocked:
+        versions:
+          - https://github.com/etcd-io/etcd:
+              version: '>= 3.4.10 || ~3.3.23'
+              reason: CVE-2020-15114; CVE-2020-15136; CVE-2020-15115
+          - https://github.com/dgrijalva/jwt-go:
+              version: '>= 4.0.0-preview1'
+              reason: CVE-2020-26160
+    lll:
+      line-length: 150
+    misspell:
+      locale: US
+    nolintlint:
+      require-explanation: false
+      require-specific: false
+      allow-unused: false
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - gosec
+        path: _test\.go
+      - linters:
+          - lll
+        source: https://
+      - linters:
+          - revive
+        path: (types|interfaces)/
+      - linters:
+          - revive
+        path: rpc/namespaces/ethereum/net/
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - x/evm/types/preinstall.go
+issues:
+  max-same-issues: 50
+formatters:
+  enable:
+    - gofumpt
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

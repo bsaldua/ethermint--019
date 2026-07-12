@@ -1,0 +1,445 @@
+// Copyright 2021 Evmos Foundation
+// This file is part of Evmos' Ethermint library.
+//
+// The Ethermint library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The Ethermint library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the Ethermint library. If not, see https://github.com/evmos/ethermint/blob/main/LICENSE
+package backend
+
+import (
+	"fmt"
+	"math"
+	"math/big"
+	"strconv"
+
+	errorsmod "cosmossdk.io/errors"
+	sdkmath "cosmossdk.io/math"
+	cmtrpcclient "github.com/cometbft/cometbft/rpc/client"
+	cmtrpctypes "github.com/cometbft/cometbft/rpc/core/types"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	gethmath "github.com/ethereum/go-ethereum/common/math"
+	ethtypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rpc"
+	rpctypes "github.com/evmos/ethermint/rpc/types"
+	ethermint "github.com/evmos/ethermint/types"
+	evmtypes "github.com/evmos/ethermint/x/evm/types"
+	feemarkettypes "github.com/evmos/ethermint/x/feemarket/types"
+	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
+)
+
+// ChainID is the EIP-155 replay-protection chain id for the current ethereum chain config.
+func (b *Backend) ChainID() (*hexutil.Big, error) {
+	// if current block is at or past the EIP-155 replay-protection fork block, return chainID from config
+	bn, err := b.BlockNumber()
+	if err != nil {
+		b.logger.Debug("failed to fetch latest block number", "error", err.Error())
+		return (*hexutil.Big)(b.chainID), nil
+	}
+
+	config := b.ChainConfig()
+	if config == nil {
+		// assume eip-155 is enabled
+		return (*hexutil.Big)(b.chainID), nil
+	}
+
+	if config.IsEIP155(new(big.Int).SetUint64(uint64(bn))) {
+		return (*hexutil.Big)(config.ChainID), nil
+	}
+
+	return nil, fmt.Errorf("chain not synced beyond EIP-155 replay-protection fork block")
+}
+
+// ChainConfig returns the latest ethereum chain configuration
+func (b *Backend) ChainConfig() *params.ChainConfig {
+	params, err := b.queryClient.Params(b.ctx, &evmtypes.QueryParamsRequest{})
+	if err != nil {
+		return nil
+	}
+
+	return params.Params.ChainConfig.EthereumConfig(b.chainID)
+}
+
+// GlobalMinGasPrice returns MinGasPrice param from FeeMarket
+func (b *Backend) GlobalMinGasPrice() (sdkmath.LegacyDec, error) {
+	res, err := b.queryClient.FeeMarket.Params(b.ctx, &feemarkettypes.QueryParamsRequest{})
+	if err != nil {
+		return sdkmath.LegacyZeroDec(), err
+	}
+	return res.Params.MinGasPrice, nil
+}
+
+// BaseFee returns the base fee tracked by the Fee Market module.
+// If the base fee is not enabled globally, the query returns nil.
+// If the London hard fork is not activated at the current height, the query will
+// return nil.
+func (b *Backend) BaseFee(blockRes *cmtrpctypes.ResultBlockResults) (*big.Int, error) {
+	// return BaseFee if London hard fork is activated and feemarket is enabled
+	res, err := b.queryClient.BaseFee(rpctypes.ContextWithHeight(blockRes.Height), &evmtypes.QueryBaseFeeRequest{})
+	if err != nil || res.BaseFee == nil {
+		// we can't tell if it's london HF not enabled or the state is pruned,
+		// in either case, we'll fallback to parsing from begin blocker event,
+		// faster to iterate reversely
+		for i := len(blockRes.FinalizeBlockEvents) - 1; i >= 0; i-- {
+			evt := blockRes.FinalizeBlockEvents[i]
+			if evt.Type == feemarkettypes.EventTypeFeeMarket && len(evt.Attributes) > 0 {
+				baseFee, err := strconv.ParseInt(evt.Attributes[0].Value, 10, 64)
+				if err == nil {
+					return big.NewInt(baseFee), nil
+				}
+				break
+			}
+		}
+		return nil, err
+	}
+
+	if res.BaseFee == nil {
+		return nil, nil
+	}
+
+	return res.BaseFee.BigInt(), nil
+}
+
+// NextBaseFee returns the base fee of the next block.
+func (b *Backend) NextBaseFee() (*big.Int, error) {
+	tendermintBlock, err := b.TendermintBlockByNumber(rpctypes.EthLatestBlockNumber)
+	if err != nil {
+		return nil, err
+	}
+	blockHeight := tendermintBlock.Block.Height
+
+	cfg := b.ChainConfig()
+	if cfg == nil || !cfg.IsLondon(big.NewInt(blockHeight+1)) {
+		return new(big.Int), nil
+	}
+
+	blockRes, err := b.TendermintBlockResultByNumber(&blockHeight)
+	if err != nil {
+		return nil, err
+	}
+	blockBaseFee, err := b.BaseFee(blockRes)
+	if err != nil {
+		return nil, err
+	}
+	if blockBaseFee == nil {
+		blockBaseFee = new(big.Int)
+	}
+	gasLimit, err := rpctypes.BlockMaxGasFromConsensusParams(
+		rpctypes.ContextWithHeight(blockHeight),
+		b.clientCtx,
+		blockHeight,
+	)
+	if err != nil {
+		return nil, err
+	}
+	gasLimitUint64, err := ethermint.SafeUint64(gasLimit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert gas limit: %w", err)
+	}
+	gasUsed, err := computeGasUsed(blockRes)
+	if err != nil {
+		return nil, err
+	}
+
+	feeParams, err := b.queryClient.FeeMarket.Params(
+		rpctypes.ContextWithHeight(blockHeight),
+		&feemarkettypes.QueryParamsRequest{},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	header := ethtypes.Header{
+		Number:   big.NewInt(blockHeight),
+		BaseFee:  blockBaseFee,
+		GasLimit: gasLimitUint64,
+		GasUsed:  gasUsed,
+	}
+	nextBaseFee, err := CalcBaseFee(cfg, &header, feeParams.Params)
+	if err != nil {
+		return nil, err
+	}
+	return nextBaseFee, nil
+}
+
+// CurrentHeader returns the latest block header.
+func (b *Backend) CurrentHeader() (*ethtypes.Header, error) {
+	return b.HeaderByNumber(rpctypes.EthLatestBlockNumber)
+}
+
+// PendingTransactions returns the transactions that are in the transaction pool
+// and have a from address that is one of the accounts this node manages.
+func (b *Backend) PendingTransactions() ([]*sdk.Tx, error) {
+	if b.mempoolClient != nil {
+		pendingTxs := b.mempoolClient.PendingTxs()
+		result := make([]*sdk.Tx, 0, len(pendingTxs))
+		for _, tx := range pendingTxs {
+			result = append(result, &tx)
+		}
+		return result, nil
+	}
+
+	mc, ok := b.clientCtx.Client.(cmtrpcclient.MempoolClient)
+	if !ok {
+		return nil, errors.New("invalid rpc client")
+	}
+	res, err := mc.UnconfirmedTxs(b.ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*sdk.Tx, 0, len(res.Txs))
+	for _, txBz := range res.Txs {
+		tx, err := b.clientCtx.TxConfig.TxDecoder()(txBz)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, &tx)
+	}
+
+	return result, nil
+}
+
+// GetCoinbase is the address that staking rewards will be send to (alias for Etherbase).
+func (b *Backend) GetCoinbase() (sdk.AccAddress, error) {
+	node, err := b.clientCtx.GetNode()
+	if err != nil {
+		return nil, err
+	}
+
+	status, err := node.Status(b.ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	req := &evmtypes.QueryValidatorAccountRequest{
+		ConsAddress: sdk.ConsAddress(status.ValidatorInfo.Address).String(),
+	}
+
+	res, err := b.queryClient.ValidatorAccount(b.ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	address, _ := sdk.AccAddressFromBech32(res.AccountAddress)
+	return address, nil
+}
+
+var (
+	errInvalidPercentile  = fmt.Errorf("invalid reward percentile")
+	errRequestBeyondHead  = fmt.Errorf("request beyond head block")
+	errTooManyPercentiles = fmt.Errorf("too many reward percentiles")
+)
+
+// maxFeeHistoryRewardPercentiles bounds the length of the rewardPercentiles
+// array accepted by eth_feeHistory.
+const maxFeeHistoryRewardPercentiles = 100
+
+// FeeHistory returns data relevant for fee estimation based on the specified range of blocks.
+func (b *Backend) FeeHistory(
+	userBlockCount gethmath.HexOrDecimal64, // number blocks to fetch, maximum is 100
+	lastBlock rpc.BlockNumber, // the block to start search , to oldest
+	rewardPercentiles []float64, // percentiles to fetch reward
+) (*rpctypes.FeeHistoryResult, error) {
+	if len(rewardPercentiles) > maxFeeHistoryRewardPercentiles {
+		return nil, fmt.Errorf("%w: %d > %d", errTooManyPercentiles, len(rewardPercentiles), maxFeeHistoryRewardPercentiles)
+	}
+	for i, p := range rewardPercentiles {
+		if p < 0 || p > 100 {
+			return nil, fmt.Errorf("%w: %f", errInvalidPercentile, p)
+		}
+		if i > 0 && p < rewardPercentiles[i-1] {
+			return nil, fmt.Errorf("%w: #%d:%f > #%d:%f", errInvalidPercentile, i-1, rewardPercentiles[i-1], i, p)
+		}
+	}
+	blkNumber, err := b.BlockNumber()
+	if err != nil {
+		return nil, err
+	}
+	blockNumber, err := ethermint.SafeHexToInt64(blkNumber)
+	if err != nil {
+		return nil, err
+	}
+	blockEnd := int64(lastBlock)
+	switch lastBlock {
+	case rpc.EarliestBlockNumber:
+		blockEnd = 0
+	case rpc.LatestBlockNumber, rpc.PendingBlockNumber, rpc.SafeBlockNumber, rpc.FinalizedBlockNumber:
+		blockEnd = blockNumber
+	default:
+		if blockEnd < 0 {
+			return nil, fmt.Errorf("invalid block number: %d", blockEnd)
+		}
+		if blockNumber < blockEnd {
+			return nil, fmt.Errorf("%w: requested %d, head %d", errRequestBeyondHead, blockEnd, blockNumber)
+		}
+	}
+
+	blocks, err := ethermint.SafeInt64(uint64(userBlockCount))
+	if err != nil {
+		return nil, err
+	}
+	maxBlockCount := int64(b.cfg.JSONRPC.FeeHistoryCap)
+	if blocks > maxBlockCount {
+		blocks = maxBlockCount
+	}
+	if blocks == 0 {
+		return &rpctypes.FeeHistoryResult{
+			OldestBlock:      (*hexutil.Big)(new(big.Int)),
+			BaseFee:          []*hexutil.Big{},
+			GasUsedRatio:     []float64{},
+			BlobBaseFee:      []*hexutil.Big{},
+			BlobGasUsedRatio: []float64{},
+		}, nil
+	}
+	if blockEnd < math.MaxInt64 && blockEnd+1 < blocks {
+		blocks = blockEnd + 1
+	}
+	// Ensure not trying to retrieve before genesis.
+	blockStart := blockEnd + 1 - blocks
+	oldestBlock := (*hexutil.Big)(big.NewInt(blockStart))
+
+	// prepare space
+	reward := make([][]*hexutil.Big, blocks)
+	rewardCount := len(rewardPercentiles)
+	for i := 0; i < int(blocks); i++ {
+		reward[i] = make([]*hexutil.Big, rewardCount)
+	}
+
+	thisBaseFee := make([]*hexutil.Big, blocks+1)
+	thisGasUsedRatio := make([]float64, blocks)
+
+	// rewards should only be calculated if reward percentiles were included
+	calculateRewards := rewardCount != 0
+	const maxBlockFetchers = 4
+
+	g := new(errgroup.Group)
+	g.SetLimit(maxBlockFetchers)
+	for i := int64(0); i < blocks; i++ {
+		index := int32(i) //#nosec G115 -- blocks is bounded by FeeHistoryCap (int32)
+		g.Go(func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = errorsmod.Wrapf(errortypes.ErrPanic, "%v", r)
+					b.logger.Error("FeeHistory panicked", "error", err)
+				}
+			}()
+
+			// fetch block
+			// tendermint block
+			blockNum := rpctypes.BlockNumber(blockStart + int64(index))
+			tendermintblock, err := b.TendermintBlockByNumber(blockNum)
+			if err != nil {
+				return err
+			}
+
+			// eth block
+			ethBlock, err := b.GetBlockByNumber(blockNum, true)
+			if ethBlock == nil {
+				if err == nil {
+					err = fmt.Errorf("eth block not found: %d", blockNum)
+				}
+				return err
+			}
+
+			// tendermint block result
+			tendermintBlockResult, err := b.TendermintBlockResultByNumber(&tendermintblock.Block.Height)
+			if tendermintBlockResult == nil {
+				if err == nil {
+					err = fmt.Errorf("block result not found: %d", tendermintblock.Block.Height)
+				}
+				b.logger.Debug("block result not found", "height", tendermintblock.Block.Height, "error", err.Error())
+				return err
+			}
+
+			oneFeeHistory := rpctypes.OneFeeHistory{}
+			if err := b.processBlocker(tendermintblock, &ethBlock, rewardPercentiles, tendermintBlockResult, &oneFeeHistory); err != nil {
+				return err
+			}
+
+			// copy; each goroutine writes a distinct index
+			thisBaseFee[index] = (*hexutil.Big)(oneFeeHistory.BaseFee)
+			// only use NextBaseFee as last item to avoid concurrent write
+			if int(index) == len(thisBaseFee)-2 {
+				thisBaseFee[index+1] = (*hexutil.Big)(oneFeeHistory.NextBaseFee)
+			}
+			thisGasUsedRatio[index] = oneFeeHistory.GasUsedRatio
+			if calculateRewards {
+				for j := 0; j < rewardCount; j++ {
+					reward[index][j] = (*hexutil.Big)(oneFeeHistory.Reward[j])
+					if reward[index][j] == nil {
+						reward[index][j] = (*hexutil.Big)(big.NewInt(0))
+					}
+				}
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// EIP-4844 blob transactions are not supported; return zeros per spec.
+	thisBlobBaseFee := make([]*hexutil.Big, blocks+1)
+	for i := range thisBlobBaseFee {
+		thisBlobBaseFee[i] = (*hexutil.Big)(new(big.Int))
+	}
+	thisBlobGasUsedRatio := make([]float64, blocks)
+
+	feeHistory := rpctypes.FeeHistoryResult{
+		OldestBlock:      oldestBlock,
+		BaseFee:          thisBaseFee,
+		GasUsedRatio:     thisGasUsedRatio,
+		BlobBaseFee:      thisBlobBaseFee,
+		BlobGasUsedRatio: thisBlobGasUsedRatio,
+	}
+
+	if calculateRewards {
+		feeHistory.Reward = reward
+	}
+
+	return &feeHistory, nil
+}
+
+// SuggestGasTipCap returns the suggested tip cap
+// Although we don't support tx prioritization yet, but we return a positive value to help client to
+// mitigate the base fee changes.
+func (b *Backend) SuggestGasTipCap(baseFee *big.Int) (*big.Int, error) {
+	if baseFee == nil {
+		// london hardfork not enabled or feemarket not enabled
+		return big.NewInt(0), nil
+	}
+
+	params, err := b.queryClient.FeeMarket.Params(b.ctx, &feemarkettypes.QueryParamsRequest{})
+	if err != nil {
+		return nil, err
+	}
+	// calculate the maximum base fee delta in current block, assuming all block gas limit is consumed
+	// ```
+	// GasTarget = GasLimit / ElasticityMultiplier
+	// Delta = BaseFee * (GasUsed - GasTarget) / GasTarget / Denominator
+	// ```
+	// The delta is at maximum when `GasUsed` is equal to `GasLimit`, which is:
+	// ```
+	// MaxDelta = BaseFee * (GasLimit - GasLimit / ElasticityMultiplier) / (GasLimit / ElasticityMultiplier) / Denominator
+	//          = BaseFee * (ElasticityMultiplier - 1) / Denominator
+	// ```
+	maxDelta := baseFee.Int64() * (int64(params.Params.ElasticityMultiplier) - 1) / int64(params.Params.BaseFeeChangeDenominator)
+	if maxDelta < 0 {
+		// impossible if the parameter validation passed.
+		maxDelta = 0
+	}
+	return big.NewInt(maxDelta), nil
+}

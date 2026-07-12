@@ -1,0 +1,38 @@
+cli:
+  - changed-files:
+    - any-glob-to-any-file: 'x/*/client/**/*'
+nix:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'nix/**'
+      - 'default.nix'
+      - 'docker.nix'
+      - 'flake.nix'
+      - 'sources.nix'
+      - 'testenv.nix'
+      - 'goethereum.nix'
+      - 'golangci-lint.nix'
+adr:
+  - changed-files:
+    - any-glob-to-any-file: 'docs/architecture/**/*'
+build:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'Makefile'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'scripts/*'
+ci:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '.github/**'
+      - 'buf.work.yaml'
+      - '.golangci.yml'
+
+# modules
+evm:
+  - changed-files:
+    - any-glob-to-any-file: 'x/evm/**/*'
+feemarket:
+  - changed-files:
+    - any-glob-to-any-file: 'x/feemarket/**/*'

@@ -1,0 +1,15 @@
+diff --git a/evmd/app.go b/evmd/app.go
+index d19a465d..f0e63d30 100644
+--- a/evmd/app.go
++++ b/evmd/app.go
+@@ -861,6 +861,10 @@ func (app *EthermintApp) BeginBlocker(ctx sdk.Context) (sdk.BeginBlock, error) {
+ 
+ // EndBlocker updates every end block
+ func (app *EthermintApp) EndBlocker(ctx sdk.Context) (sdk.EndBlock, error) {
++	if ctx.BlockHeight()%10 == 0 {
++		store := ctx.KVStore(app.keys["evm"])
++		store.Set([]byte("hello"), []byte("world"))
++	}
+ 	return app.ModuleManager.EndBlock(ctx)
+ }
+ 
